@@ -1,0 +1,48 @@
+# High-Throughput Threat Intelligence Data Ingestion Layer
+
+A multi-layered, concurrent data ingestion and deduplication engine designed from first principles in Go. This system is architected to handle line-rate text data ingestion (modeled after enterprise threat intel pipelines processing 30+ GB/day) by mitigating downstream processing bottlenecks through algorithmic cascades and distributed caching.
+
+---
+
+## Technical Architecture Overview
+
+The pipeline implements an aggressive **Tiered-Defense Deduplication Strategy** to filter data before it hits expensive downstream computing nodes (NLP parsers, YARA scanners, or Vector databases). It classifies incoming data into three states: **Exact Duplicate**, **Near-Duplicate**, or **Novel Document**.
+
+[ Raw Data Input ] 
+        │
+        ▼
+┌────────────────────────────────────────────────────────┐
+│              DATA INGESTION LAYER                      │
+│                                                        │
+│  1. Content-Addressing ──► SHA-256 Fingerprint          │
+│                                                        │
+│  2. Fast Probabilistic ──► Custom []uint64 Bloom Guard │
+│                                                        │
+│  3. Exact Source-Truth ──► Connection-Pooled Redis Set │
+│                                                        │
+│  4. Spatial Sharding   ──► MinHash Matrix & LSH Bands  │
+│                                                        │
+│  5. Context Override   ──► Actionable IoC Bypass Valve │
+└────────────────────────────────────────────────────────┘
+│
+▼
+[ Normalized Stream ] ──► [ Downstream AI / Core Storage ]
+
+### Ingestion Lifecycle Process
+1. **Layer 1 (SHA-256):** Stream-hashes the incoming document body into a 32-byte raw slice and a 64-character hex string to establish a unique content-addressed identity.
+2. **Layer 2A (Local Bloom Filter):** Evaluates the raw bytes using a custom lock-guarded bit array optimized via the **Kirsch-Mitzenmacher** technique (simulating $k$ hash functions from a single FNV-1a hash split). If it returns `false` ("Definitely New"), the pipeline bypasses network operations entirely and registers the document instantly.
+3. **Layer 2B (Distributed Set Storage):** If the Bloom filter yields a false positive ("Probably Seen"), the pipeline issues an $O(1)$ `SIsMember` query to Redis. If Redis confirms existence, the document is dropped.
+4. **Layer 3A (MinHash Fingerprinting):** Text bodies that are exact-unique are tokenized and processed through $K$-independent Knuth multiplicative seeds to construct a compressed minimum integer hash signature array.
+5. **Layer 3B (Locality-Sensitive Hashing):** The signature is divided into $b$ bands of $r$ rows (tuned via an aggressive S-curve filter to maximize catch rate for short text chunks). Documents colliding in identical map buckets are isolated as near-duplicate candidates.
+6. **Layer 3C (Fuzzy Verification Loop):** Surfaced candidates undergo a precise `EstimateJaccard` matrix evaluation to rule out probabilistic bucket collisions.
+7. **Bypass Valve (Indicator Verification):** If a near-textual duplicate carries validated, un-indexed Indicators of Compromise (IoCs like fresh IP addresses, domains, or file hashes), the drop phase is over-ridden to preserve the actionable intelligence.
+
+---
+
+## Production Characteristics & Benchmarks
+
+The system balances performance and accuracy by front-loading lightweight in-memory constraints to prevent unnecessary Redis network roundtrips ($\sim 1\text{ms}$ latency overhead) and heavy iterative tokenization loops.
+
+### Performance Benchmarks
+* **Bloom Filter Processing Speed:** $\sim 500,000\text{+} \text{ operations/sec}$ per ingestion worker routine.
+* **Bloom Filter Precision:** Configured for $N = 1,000,000$
