@@ -3,6 +3,7 @@ package minhash
 import (
 	"math"
 	"strings"
+	"sync"
 )
 
 type MinHasher struct {
@@ -32,9 +33,18 @@ func tokenize(text string) []string {
 	return strings.Fields(strings.ToLower(text))
 }
 
+var sigPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]uint64, 200)
+		return &s
+	},
+}
+
 func (m *MinHasher) Signature(text string) []uint64 {
 	words := tokenize(text)
-	sig := make([]uint64, m.numHashes)
+	sigPtr := sigPool.Get().(*[]uint64)
+	sig := *sigPtr
+	defer sigPool.Put(sigPtr)
 	for i := range sig {
 		sig[i] = math.MaxUint64
 	}
@@ -49,7 +59,9 @@ func (m *MinHasher) Signature(text string) []uint64 {
 			}
 		}
 	}
-	return sig
+	result := make([]uint64, len(sig))
+	copy(result, sig)
+	return result
 }
 
 func EstimateJaccard(sigA, sigB []uint64) float64 {

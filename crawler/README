@@ -1,0 +1,93 @@
+## Layer 2 — Crawler
+
+Fetches documents from clearnet and Tor sources, extracts clean text and 
+structured indicators, and feeds them into the Layer 1 dedup pipeline. 
+Designed to survive real-world failure modes: slow/dead hosts, malformed 
+HTML, duplicate URLs, and transient network errors — not just the happy path.
+
+### Architecture
+URL → frontier check → rate limiter → fetch (w/ retry) → extract text → extract entities → pipeline.Process()
+
+Each stage is an independently tested package. The orchestrator wires 
+them together with a streaming worker pool.
+
+### Components
+
+**clients/** — clearnet `http.Client` with connection pooling and 
+configurable timeouts; Tor client routed through local SOCKS5 proxy 
+(127.0.0.1:9050), verified against check.torproject.org.
+
+**fetcher/** — wraps either client behind one interface. Uses 
+`http.NewRequestWithContext` (not `http.Get`) for cancellation support, 
+`io.LimitReader` to cap response size (5MB default) and prevent OOM from 
+malicious/oversized responses.
+
+**rateLimiter/** — per-host token bucket (golang.org/x/time/rate), lazily 
+created per domain, protected by mutex. Verified independent hosts don't 
+block each other; verified sustained rate is actually enforced over time.
+
+**retry/** — exponential backoff with full jitter, context-aware sleep 
+(respects cancellation mid-backoff), distinguishes retryable errors 
+(timeouts, 429, 503) from terminal ones (404) so failures don't waste 
+attempts on unrecoverable cases.
+
+**extractor/** — DOM-tree text extraction via golang.org/x/net/html. 
+Bounded input size (truncates before parsing, not after) and bounded node 
+count to survive pathological/oversized HTML without stalling a worker. 
+Skips script/style/noscript/iframe/svg subtrees entirely.
+
+**entities/** — structured indicator extraction from clean text: IPs 
+(regex candidate + `net.ParseIP` validation, rejects malformed octets), 
+hashes (MD5/SHA1/SHA256 by length, filtered against known noise hashes 
+like sha256("")), CVEs (regex + year-range validation), domains (regex + 
+public suffix validation via golang.org/x/net/publicsuffix), emails.
+
+**orchestrator/** — streaming worker pool. Producer/consumer pattern 
+decoupled from total URL count (no need to know total work upfront). 
+URL frontier (separate Bloom filter instance, scoped to URLs — distinct 
+from the pipeline's content-hash Bloom filter) prevents re-crawling 
+already-seen URLs before spending a rate-limit token or network call on 
+them. Workers respect context cancellation mid-poll, not just at fetch time.
+
+### Performance
+
+- extractor: 6.8MB bounded input → 5MB cap, processed in 128ms, 
+  extracted 2.6M chars
+- orchestrator: cancellation halts new work within ~1 polling cycle of 
+  ctx.Done() (verified: 2/20 queued URLs processed before cancel took effect)
+- rate limiter: 10 requests under throttling took 2.5s (matches configured 
+  rate); cross-host isolation confirmed at 12.8µs (no cross-blocking)
+
+### Known limitations
+
+- **Domain extraction false-positive rate is high.** "example.com" in 
+  prose is indistinguishable from actual C2 infrastructure using regex + 
+  TLD validation alone. Solving this requires contextual/semantic 
+  classification (NLP), not pattern matching — explicitly out of scope 
+  for this layer.
+- **No reputation-checked validation.** Indicators are format/syntax-valid 
+  only — a hash matching SHA-256 length and not in the known-noise list is 
+  not the same as a hash confirmed malicious. Would require an external 
+  enrichment stage (VirusTotal-style API) as a separate, optional pipeline 
+  stage.
+- **No robots.txt compliance** — not implemented for clearnet sources.
+- **No Tor circuit rotation** — a single dead/slow circuit isn't retried 
+  with a fresh one (would require Tor control-port integration, e.g. 
+  `SIGNAL NEWNYM`).
+- **URL frontier is in-memory only** — lost on restart, no persistence 
+  across orchestrator runs.
+- **Action string collision risk** — pipeline-level outcomes ("pass", 
+  "drop") and frontier-level outcomes ("skip") are both stored in the 
+  same `Action` field; consuming code must not conflate dedup at the 
+  URL layer with dedup at the content layer, since they answer different 
+  questions.
+
+### What would change in production
+
+- Persistent URL frontier (Redis-backed, same pattern as Layer 1's 
+  content hash store)
+- Domain/IP reputation enrichment as an optional async stage, not inline
+- robots.txt parsing and per-host caching
+- Tor control-port integration for circuit rotation on failure
+- Prometheus metrics: fetch latency, retry counts, skip rate, drop rate, 
+  per-stage error rate
