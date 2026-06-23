@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"log"
 	"sync"
 	"threat_pipeline/crawler/entities"
 	"threat_pipeline/crawler/extractor"
@@ -11,23 +10,27 @@ import (
 	"threat_pipeline/crawler/retry"
 	"threat_pipeline/data_ingestion/bloom"
 	"threat_pipeline/data_ingestion/pipeline"
-	"time"
+	"threat_pipeline/detection"
+	"threat_pipeline/sandbox"
 )
 
 type Orchestrator struct {
 	Fetcher  *fetcher.Fetcher
 	Limiter  *ratelimiter.HostLimiter
 	Pipeline *pipeline.Pipeline
+	Detector *detection.RuleEngine
+
 	workers  int
 	maxBytes int
 	urlSeen  *bloom.BloomFilter
 }
 
-func New(fetcher *fetcher.Fetcher, limiter *ratelimiter.HostLimiter, pipeline *pipeline.Pipeline, workers int, maxBytes int) *Orchestrator {
+func New(fetcher *fetcher.Fetcher, limiter *ratelimiter.HostLimiter, pipeline *pipeline.Pipeline, detector *detection.RuleEngine, workers int, maxBytes int) *Orchestrator {
 	return &Orchestrator{
 		Fetcher:  fetcher,
 		Limiter:  limiter,
 		Pipeline: pipeline,
+		Detector: detector,
 		workers:  workers,
 		urlSeen:  bloom.New(958058, 7),
 		maxBytes: maxBytes,
@@ -35,10 +38,12 @@ func New(fetcher *fetcher.Fetcher, limiter *ratelimiter.HostLimiter, pipeline *p
 }
 
 type CrawlResults struct {
-	URL    string
-	Action string
-	Reason string
-	Err    error
+	URL     string
+	Action  string
+	Reason  string
+	Err     error
+	Matches []detection.RuleMatch
+	Risk    detection.Risk
 }
 
 func (o *Orchestrator) Run(ctx context.Context, produce func(ctx context.Context, out chan<- string)) <-chan CrawlResults {
@@ -109,10 +114,28 @@ func (o *Orchestrator) processOne(ctx context.Context, url string) CrawlResults 
 	indicators := entities.Extract(text)
 	doc := &pipeline.Document{Body: text, Indicators: indicators.Flatten()}
 
-	start := time.Now()
 	res := o.Pipeline.Process(ctx, doc)
-
-	log.Printf("[%s][%s][%s] in %v", url, res.Action, res.Reason, time.Since(start))
-
-	return CrawlResults{URL: url, Action: res.Action, Reason: res.Reason}
+	if res.Action != "pass" {
+		return CrawlResults{
+			Action: res.Action,
+			Reason: res.Reason,
+			URL:    url,
+		}
+	}
+	analysis := sandbox.Sandbox(ctx, doc.Body, o.Detector)
+	if analysis.Err != nil {
+		return CrawlResults{
+			URL:    url,
+			Action: "drop",
+			Reason: analysis.Err.Error(),
+			Err:    analysis.Err,
+		}
+	}
+	return CrawlResults{
+		URL:     url,
+		Action:  res.Action,
+		Reason:  res.Reason,
+		Matches: analysis.Matches,
+		Risk:    analysis.Risk,
+		Err:     analysis.Err}
 }

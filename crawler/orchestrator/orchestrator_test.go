@@ -5,7 +5,11 @@ import (
 	"fmt"
 	"testing"
 	"threat_pipeline/crawler/client"
+	"threat_pipeline/crawler/entities"
+	"threat_pipeline/crawler/extractor"
 	"threat_pipeline/crawler/fetcher"
+	"threat_pipeline/detection"
+	"threat_pipeline/sandbox"
 
 	ratelimiter "threat_pipeline/crawler/rateLimiter"
 	"threat_pipeline/data_ingestion/bloom"
@@ -27,8 +31,9 @@ func TestOrchestratorStreamingResults(t *testing.T) {
 	bf := bloom.New(958058, 7)
 	mock := store.NewMock()
 	pipe := pipeline.New(msh, bf, mock, lshIdx)
+	engine := detection.New(detection.DefaultRules)
 
-	orch := New(f, l, pipe, 3, 5*1024*1024)
+	orch := New(f, l, pipe, engine, 3, 5*1024*1024)
 
 	produce := func(ctx context.Context, out chan<- string) {
 		urls := []string{"https://httpbin.org/html", "https://httpbin.org/get"}
@@ -68,8 +73,8 @@ func TestOrchestratorRespectsCancellation(t *testing.T) {
 	bf := bloom.New(958058, 7)
 	mock := store.NewMock()
 	pipe := pipeline.New(msh, bf, mock, lshIdx)
-
-	orch := New(f, l, pipe, 2, 5*1024*1024)
+	engine := detection.New(detection.DefaultRules)
+	orch := New(f, l, pipe, engine, 2, 5*1024*1024)
 
 	produce := func(ctx context.Context, out chan<- string) {
 		for i := 0; i < 20; i++ { // more URLs than will finish before cancel
@@ -107,8 +112,9 @@ func TestOrchestratorSkipsDuplicateURL(t *testing.T) {
 	bf := bloom.New(958058, 7)
 	mock := store.NewMock()
 	pipe := pipeline.New(msh, bf, mock, lshIdx)
+	engine := detection.New(detection.DefaultRules)
 
-	orch := New(f, l, pipe, 2, 5*1024*1024)
+	orch := New(f, l, pipe, engine, 2, 5*1024*1024)
 
 	produce := func(ctx context.Context, out chan<- string) {
 		// same URL queued twice by an external producer
@@ -178,8 +184,8 @@ func BenchmarkOrchestratorThroughput(b *testing.B) {
 	bf := bloom.New(958058, 7)
 	mock := store.NewMock()
 	pipe := pipeline.New(msh, bf, mock, lshIdx)
-
-	orch := New(f, l, pipe, 10, 5*1024*1024) // 10 workers
+	engine := detection.New(detection.DefaultRules)
+	orch := New(f, l, pipe, engine, 10, 5*1024*1024) // 10 workers
 
 	urls := make([]string, b.N)
 	for i := range urls {
@@ -232,4 +238,67 @@ func BenchmarkPipelineThroughput(b *testing.B) {
 
 	b.StopTimer()
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "docs/sec")
+}
+
+func TestOrchestratorDetection(t *testing.T) {
+	ctx := context.Background()
+
+	c := client.NewClearnet()
+	f := fetcher.New(c)
+	l := ratelimiter.New(5, 5)
+
+	msh := minhash.New(200)
+	lshIdx := lsh.New(50, 2)
+	bf := bloom.New(958058, 7)
+	mock := store.NewMock()
+
+	pipe := pipeline.New(msh, bf, mock, lshIdx)
+	engine := detection.New(detection.DefaultRules)
+
+	_ = New(f, l, pipe, engine, 1, 5*1024*1024)
+
+	html := []byte(`
+	<html>
+	<body>
+
+	verify your account immediately
+
+	https://bit.ly/abc
+
+	login.php
+
+	</body>
+	</html>
+	`)
+
+	text, _ := extractor.ExtractText(html, 5*1024*1024)
+
+	ind := entities.Extract(text)
+
+	doc := &pipeline.Document{
+		Body:       text,
+		Indicators: ind.Flatten(),
+	}
+
+	res := pipe.Process(ctx, doc)
+
+	if res.Action != "pass" {
+		t.Fatal("document should pass dedup")
+	}
+
+	analysis := sandbox.Sandbox(ctx, text, engine)
+
+	if len(analysis.Matches) == 0 {
+		t.Fatal("expected rules to fire")
+	}
+
+	if analysis.Risk.Score == 0 {
+		t.Fatalf("risk scorer failed %v %v %v", analysis.Risk.Score, analysis.Matches, analysis.Risk.Types)
+	}
+
+	t.Logf(
+		"matches=%v score=%d",
+		analysis.Matches,
+		analysis.Risk.Score,
+	)
 }
